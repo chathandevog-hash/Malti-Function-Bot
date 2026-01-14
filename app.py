@@ -1,5 +1,7 @@
 import os
 import asyncio
+import tempfile
+import shutil
 from flask import Flask
 
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -19,7 +21,6 @@ MONGO_URI = os.getenv("MONGO_URI", "")
 
 if not API_ID or not API_HASH or not BOT_TOKEN:
     raise SystemExit("❌ Missing API_ID / API_HASH / BOT_TOKEN env vars")
-
 if not MONGO_URI:
     raise SystemExit("❌ Missing MONGO_URI env var")
 
@@ -40,13 +41,9 @@ db = mongo["multifunctional_bot"]
 thumb_col = db["thumbnails"]
 
 async def set_thumb(user_id: int, file_id: str):
-    await thumb_col.update_one(
-        {"user_id": user_id},
-        {"$set": {"file_id": file_id}},
-        upsert=True
-    )
+    await thumb_col.update_one({"user_id": user_id}, {"$set": {"file_id": file_id}}, upsert=True)
 
-async def get_thumb(user_id: int):
+async def get_thumb_fileid(user_id: int):
     d = await thumb_col.find_one({"user_id": user_id})
     return d["file_id"] if d else None
 
@@ -54,7 +51,7 @@ async def delete_thumb(user_id: int):
     await thumb_col.delete_one({"user_id": user_id})
 
 # ------------------ Cache ------------------
-CACHE = {}  # user_id -> file session
+CACHE = {}
 
 # ------------------ Helper ------------------
 def sizeof_fmt(num):
@@ -69,9 +66,7 @@ def sizeof_fmt(num):
     return f"{num:.2f} PB"
 
 def get_ext(name: str):
-    if not name:
-        return ""
-    if "." not in name:
+    if not name or "." not in name:
         return ""
     return "." + name.split(".")[-1]
 
@@ -79,11 +74,80 @@ async def safe_edit(msg: Message, text: str, markup=None):
     try:
         await msg.edit_text(text, reply_markup=markup)
     except Exception:
-        # ignore MESSAGE_NOT_MODIFIED etc
         pass
 
 def error_text(e: Exception):
     return f"❌ ERROR:\n`{e}`"
+
+# ✅ New progress style
+def progress_text(step: int):
+    if step == 0:
+        return "⚪⚪⚪⚪⚪⚪⚪⚪⚪⚪⚪⚪⚪⚪⚪⚪\n0%"
+    if step == 40:
+        return "🔴🔴🔴⚪⚪⚪⚪⚪⚪⚪⚪⚪⚪⚪⚪⚪\n✅ 40%"
+    if step == 50:
+        return "🟠🟠🟠🟠🟠🟠⚪⚪⚪⚪⚪⚪⚪⚪⚪⚪\n✅ 50%"
+    if step == 75:
+        return "🟡🟡🟡🟡🟡🟡🟡🟡🟡🟡⚪⚪⚪⚪⚪⚪\n✅ 75%"
+    if step == 100:
+        return "🟢🟢🟢🟢🟢🟢🟢🟢🟢🟢🟢🟢🟢🟢🟢🟢\n100%"
+    return "Processing..."
+
+# ✅ download thumb file_id -> local jpg
+async def get_thumb_path(client: Client, user_id: int):
+    file_id = await get_thumb_fileid(user_id)
+    if not file_id:
+        return None
+    try:
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+        tmp.close()
+        await client.download_media(file_id, file_name=tmp.name)
+        return tmp.name
+    except Exception:
+        return None
+
+# ✅ main: re-upload file with new filename (title changes at top)
+async def download_and_upload(client: Client, chat_id: int, file_id: str, new_name: str, as_video: bool, thumb_path=None):
+    tmp_dir = tempfile.mkdtemp()
+
+    try:
+        dl_path = await client.download_media(file_id, file_name=tmp_dir)
+        if not dl_path:
+            raise Exception("Download failed ❌")
+
+        final_path = os.path.join(tmp_dir, new_name)
+        try:
+            os.rename(dl_path, final_path)
+        except Exception:
+            # fallback copy
+            shutil.copy(dl_path, final_path)
+
+        cap = f"✅ Renamed: `{new_name}`"
+
+        if as_video:
+            await client.send_video(
+                chat_id=chat_id,
+                video=final_path,
+                file_name=new_name,
+                thumb=thumb_path,
+                caption=cap,
+                supports_streaming=True
+            )
+        else:
+            await client.send_document(
+                chat_id=chat_id,
+                document=final_path,
+                file_name=new_name,
+                thumb=thumb_path,
+                caption=cap
+            )
+
+    finally:
+        # cleanup download temp folder
+        try:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        except:
+            pass
 
 # ------------------ Bot ------------------
 bot = Client(
@@ -133,8 +197,8 @@ async def help_cmd(_, m: Message):
 @bot.on_message(filters.command("deletetub") & filters.private)
 async def delete_tub_cmd(_, m: Message):
     uid = m.from_user.id
-    thumb = await get_thumb(uid)
-    if thumb:
+    fid = await get_thumb_fileid(uid)
+    if fid:
         await delete_thumb(uid)
         await m.reply_text("✅ Thumbnail Deleted")
     else:
@@ -147,7 +211,7 @@ async def save_thumb_cmd(_, m: Message):
     await set_thumb(uid, m.photo.file_id)
     await m.reply_text("✅ Thumbnail Saved Successfully!")
 
-# ------------------ Receive Media (FIXED) ------------------
+# ------------------ Receive Media ------------------
 @bot.on_message(filters.private & (filters.document | filters.video))
 async def receive_media(_, m: Message):
     uid = m.from_user.id
@@ -191,7 +255,7 @@ async def receive_media(_, m: Message):
 
 # ------------------ Button Handler ------------------
 @bot.on_callback_query()
-async def cb(_, cq: CallbackQuery):
+async def cb(client: Client, cq: CallbackQuery):
     uid = cq.from_user.id
 
     if cq.data == "cancel":
@@ -218,35 +282,37 @@ async def cb(_, cq: CallbackQuery):
             return
 
         sess = CACHE[uid]
-        thumb = await get_thumb(uid)
+        thumb_path = await get_thumb_path(client, uid)
 
         try:
-            await safe_edit(cq.message, "⚙️ Processing...\n\n0%")
-            await asyncio.sleep(0.4)
-            await safe_edit(cq.message, "⚙️ Processing...\n\n40%")
-            await asyncio.sleep(0.4)
-            await safe_edit(cq.message, "⚙️ Processing...\n\n65%")
-            await asyncio.sleep(0.4)
-            await safe_edit(cq.message, "✅ Done!\n\n100%")
+            await safe_edit(cq.message, progress_text(0))
+            await asyncio.sleep(0.6)
+            await safe_edit(cq.message, progress_text(40))
+            await asyncio.sleep(0.6)
+            await safe_edit(cq.message, progress_text(50))
+            await asyncio.sleep(0.6)
+            await safe_edit(cq.message, progress_text(75))
+            await asyncio.sleep(0.6)
+            await safe_edit(cq.message, progress_text(100))
 
-            cap = f"✅ Renamed: `{sess['new_name']}`"
-
+            # ✅ re-upload with new filename
             if cq.data == "fmt_doc":
-                await bot.send_document(
+                await download_and_upload(
+                    client=client,
                     chat_id=cq.message.chat.id,
-                    document=sess["file_id"],
-                    file_name=sess["new_name"],
-                    thumb=thumb,
-                    caption=cap
+                    file_id=sess["file_id"],
+                    new_name=sess["new_name"],
+                    as_video=False,
+                    thumb_path=thumb_path
                 )
             else:
-                await bot.send_video(
+                await download_and_upload(
+                    client=client,
                     chat_id=cq.message.chat.id,
-                    video=sess["file_id"],
-                    file_name=sess["new_name"],
-                    thumb=thumb,
-                    caption=cap,
-                    supports_streaming=True
+                    file_id=sess["file_id"],
+                    new_name=sess["new_name"],
+                    as_video=True,
+                    thumb_path=thumb_path
                 )
 
             CACHE.pop(uid, None)
@@ -255,6 +321,13 @@ async def cb(_, cq: CallbackQuery):
         except Exception as e:
             await cq.message.reply_text(error_text(e))
             await cq.answer("Error", show_alert=True)
+
+        finally:
+            if thumb_path and os.path.exists(thumb_path):
+                try:
+                    os.remove(thumb_path)
+                except:
+                    pass
 
 # ------------------ Name Input ------------------
 @bot.on_message(filters.private & filters.text)
@@ -274,6 +347,7 @@ async def newname(_, m: Message):
     sess = CACHE[uid]
     ext = get_ext(sess["file_name"])
 
+    # extension not required
     if ext and not name.endswith(ext):
         name += ext
 
