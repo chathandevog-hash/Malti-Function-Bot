@@ -1,6 +1,5 @@
 import os
 import asyncio
-import traceback
 from flask import Flask
 
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -12,6 +11,7 @@ from pyrogram.types import (
     InlineKeyboardButton,
 )
 
+# ------------------ ENV ------------------
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
@@ -19,6 +19,7 @@ MONGO_URI = os.getenv("MONGO_URI", "")
 
 if not API_ID or not API_HASH or not BOT_TOKEN:
     raise SystemExit("❌ Missing API_ID / API_HASH / BOT_TOKEN env vars")
+
 if not MONGO_URI:
     raise SystemExit("❌ Missing MONGO_URI env var")
 
@@ -39,7 +40,11 @@ db = mongo["multifunctional_bot"]
 thumb_col = db["thumbnails"]
 
 async def set_thumb(user_id: int, file_id: str):
-    await thumb_col.update_one({"user_id": user_id}, {"$set": {"file_id": file_id}}, upsert=True)
+    await thumb_col.update_one(
+        {"user_id": user_id},
+        {"$set": {"file_id": file_id}},
+        upsert=True
+    )
 
 async def get_thumb(user_id: int):
     d = await thumb_col.find_one({"user_id": user_id})
@@ -55,7 +60,7 @@ CACHE = {}  # user_id -> file session
 def sizeof_fmt(num):
     try:
         num = int(num)
-    except:
+    except Exception:
         return "Unknown"
     for unit in ["B", "KB", "MB", "GB", "TB"]:
         if num < 1024.0:
@@ -86,7 +91,7 @@ bot = Client(
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
-    in_memory=True,
+    in_memory=True
 )
 
 START_TEXT = """╔══════════════════════╗
@@ -142,7 +147,7 @@ async def save_thumb_cmd(_, m: Message):
     await set_thumb(uid, m.photo.file_id)
     await m.reply_text("✅ Thumbnail Saved Successfully!")
 
-# ------------------ Receive Media ------------------
+# ------------------ Receive Media (FIXED) ------------------
 @bot.on_message(filters.private & (filters.document | filters.video))
 async def receive_media(_, m: Message):
     uid = m.from_user.id
@@ -150,14 +155,14 @@ async def receive_media(_, m: Message):
     if m.document:
         media = m.document
         file_name = media.file_name or "file"
-        size = media.file_size
-        dc_id = media.dc_id
+        size = getattr(media, "file_size", 0) or 0
+        dc_id = getattr(media, "dc_id", "N/A")
         media_type = "document"
     else:
         media = m.video
         file_name = media.file_name or "video.mp4"
-        size = media.file_size
-        dc_id = media.dc_id
+        size = getattr(media, "file_size", 0) or 0
+        dc_id = getattr(media, "dc_id", "N/A")
         media_type = "video"
 
     text = (
@@ -246,6 +251,7 @@ async def cb(_, cq: CallbackQuery):
 
             CACHE.pop(uid, None)
             await cq.answer("✅ Completed")
+
         except Exception as e:
             await cq.message.reply_text(error_text(e))
             await cq.answer("Error", show_alert=True)
@@ -261,7 +267,6 @@ async def newname(_, m: Message):
     if uid not in CACHE:
         return
 
-    # must be reply
     if not m.reply_to_message:
         await m.reply_text("⚠️ Please reply to the rename message.")
         return
