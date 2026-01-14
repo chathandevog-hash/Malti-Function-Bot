@@ -1,27 +1,32 @@
 import os
+import math
 import asyncio
 from flask import Flask
 
 from motor.motor_asyncio import AsyncIOMotorClient
-
 from pyrogram import Client, filters
 from pyrogram.types import (
     Message,
+    CallbackQuery,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
 )
 
+# -----------------------------
+# ENV
+# -----------------------------
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
-MONGO_URL = os.getenv("MONGO_URL", "")
+# ✅ OPTION B: Your Render key is MONGO_URI
+MONGO_URI = os.getenv("MONGO_URI", "")
 
 if not API_ID or not API_HASH or not BOT_TOKEN:
     raise SystemExit("❌ Missing API_ID / API_HASH / BOT_TOKEN env vars")
 
-if not MONGO_URL:
-    raise SystemExit("❌ Missing MONGO_URL env var")
+if not MONGO_URI:
+    raise SystemExit("❌ Missing MONGO_URI env var")
 
 # -----------------------------
 # Flask Web Server (UptimeRobot)
@@ -37,17 +42,26 @@ def health():
     return {"status": "ok"}, 200
 
 # -----------------------------
-# MongoDB Setup
+# Mongo Setup
 # -----------------------------
-mongo = AsyncIOMotorClient(MONGO_URL)
+mongo = AsyncIOMotorClient(MONGO_URI)
 db = mongo["multifunctional_bot"]
-thumb_col = db["thumbnails"]      # {user_id:int, file_id:str}
-rename_col = db["rename_queue"]   # {user_id:int, file_id:str, file_name:str}
+thumb_col = db["thumbnails"]   # {user_id:int, file_id:str}
 
 # -----------------------------
-# In-memory rename pending (safe)
+# Cache (rename session)
 # -----------------------------
-RENAME_CACHE = {}  # user_id -> dict
+RENAME_CACHE = {}
+# user_id -> {
+#   "msg_id": int,
+#   "chat_id": int,
+#   "file_id": str,
+#   "file_name": str,
+#   "file_size": int,
+#   "dc_id": int,
+#   "is_video": bool,
+#   "new_name": str
+# }
 
 # -----------------------------
 # Texts
@@ -76,13 +90,30 @@ HELP_TEXT = """✅ Commands:
 
 📌 How to use:
 1) Send a photo to set thumbnail
-2) Send file/video -> bot asks new name
-3) Select format (Document/Video)
+2) Send file/video
+3) Click Rename
+4) Reply new name
 """
 
 # -----------------------------
-# Progress Bar
+# Helpers
 # -----------------------------
+def sizeof_fmt(num, suffix="B"):
+    if num is None:
+        return "Unknown"
+    for unit in ["", "K", "M", "G", "T", "P"]:
+        if abs(num) < 1024.0:
+            return f"{num:3.2f} {unit}{suffix}"
+        num /= 1024.0
+    return f"{num:.2f} Y{suffix}"
+
+def get_extension(file_name: str):
+    if not file_name:
+        return ""
+    if "." not in file_name:
+        return ""
+    return "." + file_name.split(".")[-1]
+
 def progress_text(step: int):
     if step == 0:
         return "⚪⚪⚪⚪⚪⚪⚪⚪⚪⚪⚪⚪⚪⚪⚪⚪\n0%"
@@ -94,9 +125,13 @@ def progress_text(step: int):
         return "🟢🟢🟢🟢🟢🟢🟢🟢🟢🟢🟢🟢🟢🟢🟢🟢\n✅ 100%"
     return "Processing..."
 
-# -----------------------------
-# Helpers (Mongo)
-# -----------------------------
+async def safe_edit(msg: Message, text: str):
+    try:
+        if (msg.text or "") != text:
+            await msg.edit_text(text)
+    except Exception:
+        pass
+
 async def set_thumb(user_id: int, file_id: str):
     await thumb_col.update_one(
         {"user_id": user_id},
@@ -112,7 +147,7 @@ async def delete_thumb(user_id: int):
     await thumb_col.delete_one({"user_id": user_id})
 
 # -----------------------------
-# Bot client
+# Bot
 # -----------------------------
 bot = Client(
     "MultiFunctionBot",
@@ -126,15 +161,15 @@ bot = Client(
 # Commands
 # -----------------------------
 @bot.on_message(filters.command("start") & filters.private)
-async def start_cmd(client: Client, message: Message):
+async def start_cmd(_, message: Message):
     await message.reply_text(START_TEXT, disable_web_page_preview=True)
 
 @bot.on_message(filters.command("help") & filters.private)
-async def help_cmd(client: Client, message: Message):
+async def help_cmd(_, message: Message):
     await message.reply_text(HELP_TEXT, disable_web_page_preview=True)
 
 @bot.on_message(filters.command("deletetub") & filters.private)
-async def delete_thumb_cmd(client: Client, message: Message):
+async def delete_thumb_cmd(_, message: Message):
     user_id = message.from_user.id
     old = await get_thumb(user_id)
     if old:
@@ -144,45 +179,94 @@ async def delete_thumb_cmd(client: Client, message: Message):
         await message.reply_text("ℹ️ No thumbnail found.")
 
 # -----------------------------
-# Save thumbnail
+# Auto thumbnail save
 # -----------------------------
 @bot.on_message(filters.private & filters.photo)
-async def save_thumb_handler(client: Client, message: Message):
+async def save_thumb(_, message: Message):
     user_id = message.from_user.id
     await set_thumb(user_id, message.photo.file_id)
     await message.reply_text("✅ Thumbnail Saved Successfully!")
 
 # -----------------------------
-# Receive file/video for rename
+# File/video receive -> show style card with buttons
 # -----------------------------
 @bot.on_message(filters.private & (filters.document | filters.video))
-async def receive_media(client: Client, message: Message):
+async def file_in(_, message: Message):
     user_id = message.from_user.id
 
     if message.document:
         media = message.document
+        is_video = False
         file_name = media.file_name or "file"
+        file_size = media.file_size
+        dc_id = media.dc_id
     else:
         media = message.video
+        is_video = True
         file_name = media.file_name or "video.mp4"
+        file_size = media.file_size
+        dc_id = media.dc_id
 
-    RENAME_CACHE[user_id] = {
-        "file_id": media.file_id,
-        "file_name": file_name
-    }
-
-    await message.reply_text(
-        f"✏️ New name send ചെയ്യൂ:\n\nCurrent: `{file_name}`",
-        quote=True
+    text = (
+        "**𝙒𝙃𝘼𝙏 𝘿𝙊 𝙔𝙊𝙐 𝙒𝘼𝙉𝙏 𝙈𝙀 𝙏𝙊 𝘿𝙊 𝙒𝙄𝙏𝙃 𝙏𝙃𝙄𝙎 𝙁𝙄𝙇𝙀 ?**\n\n"
+        f"**𝙁𝙄𝙇𝙀 𝙉𝘼𝙈𝙀 :-** `{file_name}`\n"
+        f"**𝙁𝙄𝙇𝙀 𝙎𝙄𝙕𝙀 :-** `{sizeof_fmt(file_size)}`\n"
+        f"**𝘿𝘾 𝙄𝘿 :-** `{dc_id}`"
     )
 
+    buttons = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✏️ Rename", callback_data="act_rename"),
+                InlineKeyboardButton("✖ Cancel", callback_data="act_cancel"),
+            ]
+        ]
+    )
+
+    sent = await message.reply_text(text, reply_markup=buttons)
+
+    RENAME_CACHE[user_id] = {
+        "msg_id": sent.id,
+        "chat_id": sent.chat.id,
+        "file_id": media.file_id,
+        "file_name": file_name,
+        "file_size": file_size,
+        "dc_id": dc_id,
+        "is_video": is_video,
+    }
+
 # -----------------------------
-# Rename text
+# Rename button
+# -----------------------------
+@bot.on_callback_query(filters.regex("^act_"))
+async def actions(_, cq: CallbackQuery):
+    user_id = cq.from_user.id
+
+    if cq.data == "act_cancel":
+        RENAME_CACHE.pop(user_id, None)
+        await cq.message.edit_text("✅ Cancelled.")
+        await cq.answer()
+        return
+
+    if cq.data == "act_rename":
+        if user_id not in RENAME_CACHE:
+            await cq.answer("Send a file first!", show_alert=True)
+            return
+
+        text = (
+            "**Please Enter The New Filename...**\n\n"
+            "**Note:- Extension Not Required**"
+        )
+        await cq.message.edit_text(text)
+        await cq.answer("✅ Send new name (reply)")
+
+# -----------------------------
+# Rename name input (must be reply)
 # -----------------------------
 @bot.on_message(filters.private & filters.text)
-async def rename_text(client: Client, message: Message):
+async def name_input(_, message: Message):
     user_id = message.from_user.id
-    text = message.text.strip()
+    text = (message.text or "").strip()
 
     if text.startswith("/"):
         return
@@ -190,17 +274,22 @@ async def rename_text(client: Client, message: Message):
     if user_id not in RENAME_CACHE:
         return
 
-    old_name = RENAME_CACHE[user_id]["file_name"]
+    # must be reply to bot rename prompt
+    session = RENAME_CACHE[user_id]
+    if not message.reply_to_message:
+        await message.reply_text("⚠️ Please reply to the rename message.")
+        return
 
-    ext = ""
-    if "." in old_name:
-        ext = "." + old_name.split(".")[-1]
+    # new name
+    old_name = session["file_name"]
+    ext = get_extension(old_name)
 
+    # Extension not required -> auto add
     new_name = text
     if ext and not new_name.endswith(ext):
         new_name += ext
 
-    RENAME_CACHE[user_id]["new_name"] = new_name
+    session["new_name"] = new_name
 
     buttons = InlineKeyboardMarkup(
         [[
@@ -210,41 +299,42 @@ async def rename_text(client: Client, message: Message):
     )
 
     await message.reply_text(
-        f"✅ Name Set: `{new_name}`\n\nFormat select ചെയ്യൂ:",
+        f"✅ **Name Set:** `{new_name}`\n\n**Select Format:**",
         reply_markup=buttons
     )
 
 # -----------------------------
-# Callback
+# Format callback
 # -----------------------------
-@bot.on_callback_query()
-async def cb_handler(client, callback_query):
-    user_id = callback_query.from_user.id
+@bot.on_callback_query(filters.regex("^fmt_"))
+async def format_send(client: Client, cq: CallbackQuery):
+    user_id = cq.from_user.id
 
     if user_id not in RENAME_CACHE or "new_name" not in RENAME_CACHE[user_id]:
-        await callback_query.answer("Send a file first!", show_alert=True)
+        await cq.answer("Send file + set name first!", show_alert=True)
         return
 
-    data = RENAME_CACHE[user_id]
-    file_id = data["file_id"]
-    new_name = data["new_name"]
+    session = RENAME_CACHE[user_id]
+    file_id = session["file_id"]
+    new_name = session["new_name"]
 
     thumb = await get_thumb(user_id)
 
-    await callback_query.message.edit_text(progress_text(0))
+    # Progress safely
+    await safe_edit(cq.message, progress_text(0))
     await asyncio.sleep(0.6)
-    await callback_query.message.edit_text(progress_text(40))
+    await safe_edit(cq.message, progress_text(40))
     await asyncio.sleep(0.6)
-    await callback_query.message.edit_text(progress_text(65))
+    await safe_edit(cq.message, progress_text(65))
     await asyncio.sleep(0.6)
-    await callback_query.message.edit_text(progress_text(100))
+    await safe_edit(cq.message, progress_text(100))
 
-    caption = f"✅ Renamed File: `{new_name}`"
+    caption = f"✅ Renamed: `{new_name}`"
 
     try:
-        if callback_query.data == "fmt_doc":
+        if cq.data == "fmt_doc":
             await client.send_document(
-                chat_id=callback_query.message.chat.id,
+                chat_id=cq.message.chat.id,
                 document=file_id,
                 file_name=new_name,
                 thumb=thumb,
@@ -252,23 +342,22 @@ async def cb_handler(client, callback_query):
             )
         else:
             await client.send_video(
-                chat_id=callback_query.message.chat.id,
+                chat_id=cq.message.chat.id,
                 video=file_id,
                 file_name=new_name,
                 thumb=thumb,
                 caption=caption,
                 supports_streaming=True
             )
-
-        await callback_query.answer("✅ Done!")
+        await cq.answer("✅ Done!")
     except Exception as e:
-        await callback_query.answer("❌ Failed!", show_alert=True)
-        await callback_query.message.reply_text(f"❌ Error:\n`{e}`")
+        await cq.answer("❌ Failed!", show_alert=True)
+        await cq.message.reply_text(f"❌ Error:\n`{e}`")
 
     RENAME_CACHE.pop(user_id, None)
 
 # -----------------------------
-# Run Flask + Bot
+# Start web + bot
 # -----------------------------
 if __name__ == "__main__":
     from threading import Thread
